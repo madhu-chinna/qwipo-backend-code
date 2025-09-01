@@ -5,9 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js",
-    "build": "npm install",
-    "postinstall": "npm run build"
+    "dev": "nodemon index.js"
   },
   "keywords": [],
   "author": "",
@@ -27,8 +25,5 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "optionalDependencies": {
-    "sqlite3": "^5.1.6"
   }
 }
