@@ -19,7 +19,7 @@ A robust, production-ready Node.js backend API for managing customers and their 
 
 - **Runtime**: Node.js
 - **Framework**: Express.js
-- **Database**: SQLite3
+- **Database**: SQLite3 (cross-platform compatible)
 - **Validation**: express-validator
 - **Logging**: Winston
 - **CORS**: cors middleware
@@ -226,6 +226,29 @@ Content-Type: application/json
 DELETE /api/addresses/:id
 ```
 
+**Response**: `200 OK`
+```json
+{
+  "message": "Address deleted successfully"
+}
+```
+
+**Note**: Cannot delete the last address of a customer. Customer must have at least one address.
+
+#### 5. Delete Customer
+```http
+DELETE /api/customers/:id
+```
+
+**Response**: `200 OK`
+```json
+{
+  "message": "Customer and all addresses deleted successfully"
+}
+```
+
+**Note**: This will delete the customer and all associated addresses due to CASCADE constraint.
+
 ## ✅ Validation Rules
 
 ### Customer Validation
@@ -300,6 +323,30 @@ npm test
 - **Location**: Server root directory
 
 ## 🚀 Deployment
+
+### Render Platform Deployment
+
+This backend is optimized for deployment on Render.com. Follow these steps:
+
+#### 1. **Connect Your Repository**
+- Push your code to GitHub
+- Connect your GitHub repository to Render
+- Render will automatically detect the Node.js environment
+
+#### 2. **Automatic Deployment**
+- Render will use the `render.yaml` configuration
+- Build command: `npm install`
+- Start command: `npm start`
+- Health check endpoint: `/health`
+
+#### 3. **Environment Variables**
+- `NODE_ENV`: production
+- `PORT`: 10000 (Render's default)
+
+#### 4. **Database Persistence**
+- SQLite database file is created automatically
+- Data persists between deployments
+- No external database setup required
 
 ### Production Build
 ```bash
@@ -403,6 +450,12 @@ tail -f logs/app.log
 - **Phone number duplicate**: Ensure unique phone numbers
 - **Address deletion**: Check if it's the only address
 - **Database locked**: Restart server if database is busy
+
+### Render Deployment Issues
+- **Build failures**: Check Node.js version compatibility
+- **Database errors**: Ensure sqlite3 is properly installed
+- **Port conflicts**: Render automatically assigns ports
+- **Native dependencies**: sqlite3 will auto-compile on Render's Linux servers
 
 ## 📄 License
 

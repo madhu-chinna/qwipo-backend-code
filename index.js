@@ -26,37 +26,44 @@ app.use(cors());
 app.use(express.json());
 
 // ---------- Database Setup ----------
-const db = new sqlite3.Database(path.join(__dirname, 'customer.db'), (err) => {
-  if (err) {
-    logger.error(`Database connection error: ${err.message}`);
-    return;
-  }
-  logger.info('Connected to SQLite database');
+let db;
+try {
+  const dbPath = path.join(__dirname, 'customer.db');
+  db = new sqlite3.Database(dbPath, (err) => {
+    if (err) {
+      logger.error(`Database connection error: ${err.message}`);
+      process.exit(1);
+    }
+    logger.info('Connected to SQLite database');
 
-  // Create tables if they don't exist
-  db.run(`
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            firstName TEXT NOT NULL,
-            lastName TEXT NOT NULL,
-            phoneNumber TEXT NOT NULL UNIQUE,
-            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
+    // Create tables if they don't exist
+    db.run(`
+      CREATE TABLE IF NOT EXISTS customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        firstName TEXT NOT NULL,
+        lastName TEXT NOT NULL,
+        phoneNumber TEXT NOT NULL UNIQUE,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
     `);
 
-  db.run(`
-        CREATE TABLE IF NOT EXISTS addresses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customerId INTEGER,
-            addressLine TEXT NOT NULL,
-            city TEXT NOT NULL,
-            state TEXT NOT NULL,
-            pinCode TEXT NOT NULL,
-            isPrimary BOOLEAN DEFAULT false,
-            FOREIGN KEY (customerId) REFERENCES customers(id) ON DELETE CASCADE
-        )
+    db.run(`
+      CREATE TABLE IF NOT EXISTS addresses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customerId INTEGER,
+        addressLine TEXT NOT NULL,
+        city TEXT NOT NULL,
+        state TEXT NOT NULL,
+        pinCode TEXT NOT NULL,
+        isPrimary BOOLEAN DEFAULT false,
+        FOREIGN KEY (customerId) REFERENCES customers(id) ON DELETE CASCADE
+      )
     `);
-});
+  });
+} catch (err) {
+  logger.error(`Database initialization error: ${err.message}`);
+  process.exit(1);
+}
 
 // ---------- Validation Middleware ----------
 const customerValidation = [
@@ -147,10 +154,10 @@ app.get('/api/customers', (req, res, next) => {
   const offset = (page - 1) * limit;
 
   let query = `
-      SELECT DISTINCT c.* 
-      FROM customers c 
-      LEFT JOIN addresses a ON c.id = a.customerId 
-      WHERE 1=1
+    SELECT DISTINCT c.* 
+    FROM customers c 
+    LEFT JOIN addresses a ON c.id = a.customerId 
+    WHERE 1=1
   `;
   const params = [];
 
@@ -265,9 +272,59 @@ app.put('/api/addresses/:id', [
 // Delete address
 app.delete('/api/addresses/:id', (req, res, next) => {
   const addressId = req.params.id;
-  db.run('DELETE FROM addresses WHERE id = ?', [addressId], (err) => {
+  
+  // First check if this is the only address for the customer
+  db.get('SELECT customerId FROM addresses WHERE id = ?', [addressId], (err, address) => {
     if (err) return next(err);
-    res.json({ message: 'Address deleted successfully' });
+    
+    if (!address) {
+      return res.status(404).json({ error: 'Address not found' });
+    }
+    
+    // Check if this is the only address for the customer
+    db.get('SELECT COUNT(*) as count FROM addresses WHERE customerId = ?', [address.customerId], (err, countResult) => {
+      if (err) return next(err);
+      
+      if (countResult.count <= 1) {
+        return res.status(400).json({ error: 'Cannot delete the last address. Customer must have at least one address.' });
+      }
+      
+      // Delete the address
+      db.run('DELETE FROM addresses WHERE id = ?', [addressId], (err) => {
+        if (err) return next(err);
+        res.json({ message: 'Address deleted successfully' });
+      });
+    });
+  });
+});
+
+// Delete customer and all their addresses
+app.delete('/api/customers/:id', (req, res, next) => {
+  const customerId = req.params.id;
+  
+  // First check if customer exists
+  db.get('SELECT * FROM customers WHERE id = ?', [customerId], (err, customer) => {
+    if (err) return next(err);
+    
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    
+    // Delete customer (addresses will be automatically deleted due to CASCADE)
+    db.run('DELETE FROM customers WHERE id = ?', [customerId], (err) => {
+      if (err) return next(err);
+      res.json({ message: 'Customer and all addresses deleted successfully' });
+    });
+  });
+});
+
+// Health check endpoint for Render
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    database: 'Connected',
+    uptime: process.uptime()
   });
 });
 
@@ -284,9 +341,21 @@ app.listen(PORT, () => {
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  db.close((err) => {
-    if (err) logger.error(`Error closing DB: ${err}`);
-    else logger.info('Database connection closed');
-    process.exit(0);
-  });
+  if (db) {
+    db.close((err) => {
+      if (err) logger.error(`Error closing DB: ${err}`);
+      else logger.info('Database connection closed');
+      process.exit(0);
+    });
+  }
+});
+
+process.on('SIGTERM', () => {
+  if (db) {
+    db.close((err) => {
+      if (err) logger.error(`Error closing DB: ${err}`);
+      else logger.info('Database connection closed');
+      process.exit(0);
+    });
+  }
 });
