@@ -2,8 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const { body, validationResult } = require('express-validator');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const moment = require('moment-timezone');
 const winston = require('winston');
 
 const app = express();
@@ -22,48 +21,19 @@ const logger = winston.createLogger({
 });
 
 // ---------- Middleware ----------
-app.use(cors());
+app.use(cors({
+  origin: true, // Allow all origins for testing
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
-// ---------- Database Setup ----------
-let db;
-try {
-  const dbPath = path.join(__dirname, 'customer.db');
-  db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-      logger.error(`Database connection error: ${err.message}`);
-      process.exit(1);
-    }
-    logger.info('Connected to SQLite database');
-
-    // Create tables if they don't exist
-    db.run(`
-      CREATE TABLE IF NOT EXISTS customers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        firstName TEXT NOT NULL,
-        lastName TEXT NOT NULL,
-        phoneNumber TEXT NOT NULL UNIQUE,
-        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    db.run(`
-      CREATE TABLE IF NOT EXISTS addresses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customerId INTEGER,
-        addressLine TEXT NOT NULL,
-        city TEXT NOT NULL,
-        state TEXT NOT NULL,
-        pinCode TEXT NOT NULL,
-        isPrimary BOOLEAN DEFAULT false,
-        FOREIGN KEY (customerId) REFERENCES customers(id) ON DELETE CASCADE
-      )
-    `);
-  });
-} catch (err) {
-  logger.error(`Database initialization error: ${err.message}`);
-  process.exit(1);
-}
+// ---------- In-Memory Data Storage ----------
+let customers = [];
+let addresses = [];
+let nextCustomerId = 1;
+let nextAddressId = 1;
 
 // ---------- Validation Middleware ----------
 const customerValidation = [
@@ -81,6 +51,11 @@ const customerValidation = [
 
 // ---------- Routes ----------
 
+// Test endpoint
+app.get('/', (req, res) => {
+  res.json({ message: 'Customer Management System Backend is running!' });
+});
+
 // Create a new customer with addresses
 app.post('/api/customers', customerValidation, (req, res, next) => {
   const errors = validationResult(req);
@@ -88,136 +63,173 @@ app.post('/api/customers', customerValidation, (req, res, next) => {
 
   const { customer, addresses } = req.body;
 
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
+  try {
+    // Check if phone number already exists
+    const existingCustomer = customers.find(c => c.phoneNumber === customer.phoneNumber);
+    if (existingCustomer) {
+      return res.status(400).json({ error: 'Phone number already exists' });
+    }
 
-    db.run(
-      'INSERT INTO customers (firstName, lastName, phoneNumber) VALUES (?, ?, ?)',
-      [customer.firstName, customer.lastName, customer.phoneNumber],
-      function (err) {
-        if (err) {
-          if (err.message.includes('UNIQUE constraint failed')) {
-            db.run('ROLLBACK');
-            return res.status(400).json({ error: 'Phone number already exists' });
-          }
-          logger.error(`Error creating customer: ${err}`);
-          db.run('ROLLBACK');
-          return next(err);
-        }
+    // Create new customer
+    const newCustomer = {
+      id: nextCustomerId++,
+      firstName: customer.firstName,
+      lastName: customer.lastName,
+      phoneNumber: customer.phoneNumber,
+      createdAt: moment.tz('Asia/Kolkata').format('YYYY-MM-DD HH:mm:ss')
+    };
 
-        const customerId = this.lastID;
-        let addressesProcessed = 0;
+    customers.push(newCustomer);
 
-        addresses.forEach((address) => {
-          db.run(
-            'INSERT INTO addresses (customerId, addressLine, city, state, pinCode, isPrimary) VALUES (?, ?, ?, ?, ?, ?)',
-            [customerId, address.addressLine, address.city, address.state, address.pinCode, address.isPrimary || false],
-            (err) => {
-              if (err) {
-                logger.error(`Error creating address: ${err}`);
-                db.run('ROLLBACK');
-                return next(err);
-              }
+    // Create addresses for the customer
+    const customerAddresses = addresses.map((address, index) => ({
+      id: nextAddressId++,
+      customerId: newCustomer.id,
+      addressLine: address.addressLine,
+      city: address.city,
+      state: address.state,
+      pinCode: address.pinCode,
+      isPrimary: address.isPrimary || (index === 0) // First address is primary by default
+    }));
 
-              addressesProcessed++;
-              if (addressesProcessed === addresses.length) {
-                db.run('COMMIT');
-                res.status(201).json({ message: 'Customer created successfully', customerId });
-              }
-            }
-          );
-        });
-      }
-    );
-  });
+    addresses.push(...customerAddresses);
+
+    res.status(201).json({ 
+      message: 'Customer created successfully', 
+      customerId: newCustomer.id 
+    });
+  } catch (err) {
+    logger.error(`Error creating customer: ${err}`);
+    return next(err);
+  }
 });
 
 // Get customer by ID + addresses
 app.get('/api/customers/:id', (req, res, next) => {
-  const customerId = req.params.id;
+  try {
+    const customerId = parseInt(req.params.id);
+    const customer = customers.find(c => c.id === customerId);
+    
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
 
-  db.get('SELECT * FROM customers WHERE id = ?', [customerId], (err, customer) => {
-    if (err) return next(err);
-
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
-
-    db.all('SELECT * FROM addresses WHERE customerId = ?', [customerId], (err, addresses) => {
-      if (err) return next(err);
-      res.json({ ...customer, addresses });
-    });
-  });
+    const customerAddresses = addresses.filter(a => a.customerId === customerId);
+    res.json({ ...customer, addresses: customerAddresses });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Pagination + Sorting + Filtering
 app.get('/api/customers', (req, res, next) => {
-  let { page = 1, limit = 5, sortBy = 'createdAt', order = 'DESC', city, state, pinCode } = req.query;
-  const offset = (page - 1) * limit;
+  try {
+    let { page = 1, limit = 5, sortBy = 'createdAt', order = 'DESC', city, state, pinCode } = req.query;
+    page = parseInt(page);
+    limit = parseInt(limit);
+    const offset = (page - 1) * limit;
 
-  let query = `
-    SELECT DISTINCT c.* 
-    FROM customers c 
-    LEFT JOIN addresses a ON c.id = a.customerId 
-    WHERE 1=1
-  `;
-  const params = [];
+    // Filter customers based on address criteria
+    let filteredCustomers = customers;
+    
+    if (city || state || pinCode) {
+      filteredCustomers = customers.filter(customer => {
+        const customerAddresses = addresses.filter(a => a.customerId === customer.id);
+        return customerAddresses.some(address => {
+          let matches = true;
+          if (city && !address.city.toLowerCase().includes(city.toLowerCase())) matches = false;
+          if (state && !address.state.toLowerCase().includes(state.toLowerCase())) matches = false;
+          if (pinCode && !address.pinCode.includes(pinCode)) matches = false;
+          return matches;
+        });
+      });
+    }
 
-  if (city) {
-    query += ' AND a.city LIKE ?';
-    params.push(`%${city}%`);
+    // Sort customers
+    filteredCustomers.sort((a, b) => {
+      let aValue = a[sortBy];
+      let bValue = b[sortBy];
+      
+      if (sortBy === 'createdAt') {
+        aValue = moment(aValue, 'YYYY-MM-DD HH:mm:ss');
+        bValue = moment(bValue, 'YYYY-MM-DD HH:mm:ss');
+      }
+      
+      if (order === 'ASC') {
+        return aValue > bValue ? 1 : -1;
+      } else {
+        return aValue < bValue ? 1 : -1;
+      }
+    });
+
+    // Apply pagination
+    const paginatedCustomers = filteredCustomers.slice(offset, offset + limit);
+    
+    res.json({
+      customers: paginatedCustomers,
+      pagination: {
+        page,
+        limit,
+        total: filteredCustomers.length,
+        totalPages: Math.ceil(filteredCustomers.length / limit)
+      }
+    });
+  } catch (err) {
+    return next(err);
   }
-  if (state) {
-    query += ' AND a.state LIKE ?';
-    params.push(`%${state}%`);
-  }
-  if (pinCode) {
-    query += ' AND a.pinCode LIKE ?';
-    params.push(`%${pinCode}%`);
-  }
-
-  query += ` ORDER BY c.${sortBy} ${order} LIMIT ? OFFSET ?`;
-  params.push(parseInt(limit), parseInt(offset));
-
-  db.all(query, params, (err, customers) => {
-    if (err) return next(err);
-    res.json(customers);
-  });
 });
 
 // Check if customer has only one address
 app.get('/api/customers/:id/isSingleAddress', (req, res, next) => {
-  const customerId = req.params.id;
-
-  db.get('SELECT COUNT(*) as count FROM addresses WHERE customerId = ?', [customerId], (err, row) => {
-    if (err) return next(err);
-    res.json({ hasOnlyOneAddress: row.count === 1 });
-  });
+  try {
+    const customerId = parseInt(req.params.id);
+    const customerAddresses = addresses.filter(a => a.customerId === customerId);
+    res.json({ hasOnlyOneAddress: customerAddresses.length === 1 });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Update customer
 app.put('/api/customers/:id', (req, res, next) => {
-  const { firstName, lastName, phoneNumber } = req.body;
-  db.run(
-    'UPDATE customers SET firstName = ?, lastName = ?, phoneNumber = ? WHERE id = ?',
-    [firstName, lastName, phoneNumber, req.params.id],
-    (err) => {
-      if (err) {
-        if (err.message.includes('UNIQUE constraint failed')) {
-          return res.status(400).json({ error: 'Phone number must be unique' });
-        }
-        return next(err);
-      }
-      res.json({ message: 'Customer updated successfully' });
+  try {
+    const customerId = parseInt(req.params.id);
+    const { firstName, lastName, phoneNumber } = req.body;
+    
+    const customerIndex = customers.findIndex(c => c.id === customerId);
+    if (customerIndex === -1) {
+      return res.status(404).json({ error: 'Customer not found' });
     }
-  );
+
+    // Check if phone number already exists (excluding current customer)
+    const existingCustomer = customers.find(c => c.phoneNumber === phoneNumber && c.id !== customerId);
+    if (existingCustomer) {
+      return res.status(400).json({ error: 'Phone number must be unique' });
+    }
+
+    // Update customer
+    customers[customerIndex] = {
+      ...customers[customerIndex],
+      firstName,
+      lastName,
+      phoneNumber
+    };
+
+    res.json({ message: 'Customer updated successfully' });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Get customer addresses
 app.get('/api/customers/:id/addresses', (req, res, next) => {
-  const customerId = req.params.id;
-  db.all('SELECT * FROM addresses WHERE customerId = ?', [customerId], (err, addresses) => {
-    if (err) return next(err);
-    res.json(addresses);
-  });
+  try {
+    const customerId = parseInt(req.params.id);
+    const customerAddresses = addresses.filter(a => a.customerId === customerId);
+    res.json(customerAddresses);
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Add new address
@@ -230,20 +242,48 @@ app.post('/api/customers/:id/addresses', [
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  const customerId = req.params.id;
-  const { addressLine, city, state, pinCode, isPrimary } = req.body;
+  try {
+    const customerId = parseInt(req.params.id);
+    const { addressLine, city, state, pinCode, isPrimary } = req.body;
 
-  db.run(
-    'INSERT INTO addresses (customerId, addressLine, city, state, pinCode, isPrimary) VALUES (?, ?, ?, ?, ?, ?)',
-    [customerId, addressLine, city, state, pinCode, isPrimary || false],
-    function(err) {
-      if (err) return next(err);
-      res.status(201).json({ 
-        message: 'Address added successfully',
-        addressId: this.lastID
+    // Check if customer exists
+    const customer = customers.find(c => c.id === customerId);
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    // If this is the first address, make it primary
+    const customerAddresses = addresses.filter(a => a.customerId === customerId);
+    const shouldBePrimary = isPrimary || customerAddresses.length === 0;
+
+    // If making this address primary, unset other primary addresses
+    if (shouldBePrimary) {
+      addresses.forEach(addr => {
+        if (addr.customerId === customerId) {
+          addr.isPrimary = false;
+        }
       });
     }
-  );
+
+    const newAddress = {
+      id: nextAddressId++,
+      customerId,
+      addressLine,
+      city,
+      state,
+      pinCode,
+      isPrimary: shouldBePrimary
+    };
+
+    addresses.push(newAddress);
+    
+    res.status(201).json({ 
+      message: 'Address added successfully',
+      addressId: newAddress.id
+    });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Update address
@@ -256,66 +296,98 @@ app.put('/api/addresses/:id', [
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  const addressId = req.params.id;
-  const { addressLine, city, state, pinCode, isPrimary } = req.body;
+  try {
+    const addressId = parseInt(req.params.id);
+    const { addressLine, city, state, pinCode, isPrimary } = req.body;
 
-  db.run(
-    'UPDATE addresses SET addressLine = ?, city = ?, state = ?, pinCode = ?, isPrimary = ? WHERE id = ?',
-    [addressLine, city, state, pinCode, isPrimary || false, addressId],
-    (err) => {
-      if (err) return next(err);
-      res.json({ message: 'Address updated successfully' });
+    const addressIndex = addresses.findIndex(a => a.id === addressId);
+    if (addressIndex === -1) {
+      return res.status(404).json({ error: 'Address not found' });
     }
-  );
+
+    // If making this address primary, unset other primary addresses for the same customer
+    if (isPrimary) {
+      addresses.forEach(addr => {
+        if (addr.customerId === addresses[addressIndex].customerId) {
+          addr.isPrimary = false;
+        }
+      });
+    }
+
+    // Update address
+    addresses[addressIndex] = {
+      ...addresses[addressIndex],
+      addressLine,
+      city,
+      state,
+      pinCode,
+      isPrimary: isPrimary || false
+    };
+
+    res.json({ message: 'Address updated successfully' });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Delete address
 app.delete('/api/addresses/:id', (req, res, next) => {
-  const addressId = req.params.id;
-  
-  // First check if this is the only address for the customer
-  db.get('SELECT customerId FROM addresses WHERE id = ?', [addressId], (err, address) => {
-    if (err) return next(err);
+  try {
+    const addressId = parseInt(req.params.id);
     
-    if (!address) {
+    const addressIndex = addresses.findIndex(a => a.id === addressId);
+    if (addressIndex === -1) {
       return res.status(404).json({ error: 'Address not found' });
     }
+
+    const address = addresses[addressIndex];
+    const customerAddresses = addresses.filter(a => a.customerId === address.customerId);
     
-    // Check if this is the only address for the customer
-    db.get('SELECT COUNT(*) as count FROM addresses WHERE customerId = ?', [address.customerId], (err, countResult) => {
-      if (err) return next(err);
-      
-      if (countResult.count <= 1) {
-        return res.status(400).json({ error: 'Cannot delete the last address. Customer must have at least one address.' });
-      }
-      
-      // Delete the address
-      db.run('DELETE FROM addresses WHERE id = ?', [addressId], (err) => {
-        if (err) return next(err);
-        res.json({ message: 'Address deleted successfully' });
+    if (customerAddresses.length <= 1) {
+      return res.status(400).json({ 
+        error: 'Cannot delete the last address. Customer must have at least one address.' 
       });
-    });
-  });
+    }
+
+    // Remove the address
+    addresses.splice(addressIndex, 1);
+    
+    res.json({ message: 'Address deleted successfully' });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Delete customer and all their addresses
 app.delete('/api/customers/:id', (req, res, next) => {
-  const customerId = req.params.id;
-  
-  // First check if customer exists
-  db.get('SELECT * FROM customers WHERE id = ?', [customerId], (err, customer) => {
-    if (err) return next(err);
+  try {
+    const customerId = parseInt(req.params.id);
     
-    if (!customer) {
+    const customerIndex = customers.findIndex(c => c.id === customerId);
+    if (customerIndex === -1) {
       return res.status(404).json({ error: 'Customer not found' });
     }
+
+    // Remove customer
+    customers.splice(customerIndex, 1);
     
-    // Delete customer (addresses will be automatically deleted due to CASCADE)
-    db.run('DELETE FROM customers WHERE id = ?', [customerId], (err) => {
-      if (err) return next(err);
-      res.json({ message: 'Customer and all addresses deleted successfully' });
+    // Remove all addresses for this customer
+    const addressIndices = [];
+    addresses.forEach((addr, index) => {
+      if (addr.customerId === customerId) {
+        addressIndices.push(index);
+      }
     });
-  });
+    
+    // Remove addresses in reverse order to maintain indices
+    addressIndices.reverse().forEach(index => {
+      addresses.splice(index, 1);
+    });
+
+    res.json({ message: 'Customer and all addresses deleted successfully' });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Health check endpoint for Render
@@ -323,9 +395,24 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    database: 'Connected',
-    uptime: process.uptime()
+    database: 'In-Memory Storage',
+    uptime: process.uptime(),
+    customersCount: customers.length,
+    addressesCount: addresses.length
   });
+});
+
+// Cleanup all data (for development/production deployment)
+app.delete('/api/cleanup/all', (req, res) => {
+  try {
+    customers = [];
+    addresses = [];
+    nextCustomerId = 1;
+    nextAddressId = 1;
+    res.json({ message: 'All data cleaned up successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to cleanup data' });
+  }
 });
 
 // Error Handling Middleware
@@ -334,28 +421,30 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Something went wrong, please try again later.' });
 });
 
-// ---------- Start Server ----------
-app.listen(PORT, () => {
-  logger.info(`🚀 Server running on port ${PORT}`);
-});
+// ---------- Initialize Server ----------
+const initializeServer = async () => {
+  try {
+    app.listen(PORT, () => {
+      logger.info(`🚀 Server running on port ${PORT}`);
+      logger.info(`📊 In-Memory Storage initialized`);
+      logger.info(`🔗 Health check: http://localhost:${PORT}/health`);
+    });
+  } catch (e) {
+    logger.error(`Server Error: ${e.message}`);
+    process.exit(1);
+  }
+};
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  if (db) {
-    db.close((err) => {
-      if (err) logger.error(`Error closing DB: ${err}`);
-      else logger.info('Database connection closed');
-      process.exit(0);
-    });
-  }
+  logger.info('Received SIGINT, shutting down gracefully...');
+  process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  if (db) {
-    db.close((err) => {
-      if (err) logger.error(`Error closing DB: ${err}`);
-      else logger.info('Database connection closed');
-      process.exit(0);
-    });
-  }
+  logger.info('Received SIGTERM, shutting down gracefully...');
+  process.exit(0);
 });
+
+// Start the server
+initializeServer();
